@@ -1,36 +1,80 @@
 import asyncio
 import httpx
-import random
-import json
-import re
-import uuid
 import requests
 import itertools
 import os
+import random
 import time
-from concurrent.futures import ThreadPoolExecutor
+import json
+import re
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ── Config ────────────────────────────────────────────────────────────────────
+INPUT_FILE   = "username.txt"
+WORKERS      = 10
+CONCURRENT   = 20
+DEBUG        = False
+MAX_RUNTIME  = 5.5 * 60 * 60
+START_TIME   = time.time()
+
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")  # alias, same webhook works for both
 
 COOKIES = {
-    "datr": os.environ.get("META_DATR", ""),
-    "fs": os.environ.get("META_FS", ""),
+    "datr":   os.environ.get("META_DATR", ""),
+    "fs":     os.environ.get("META_FS", ""),
     "locale": "en_US",
 }
 
-IDENTITY_ID = "921560754377590"
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-CONCURRENT = 20
-CLAIM_URL = "https://accountscenter.meta.com/api/graphql/"
+IDENTITY_ID  = os.environ.get("IDENTITY_ID", "921560754377590")
+CLAIM_URL    = "https://accountscenter.meta.com/api/graphql/"
 CLAIM_DOC_ID = "9672408826128267"
 
-# Run for 5.5 hours max so GitHub Actions doesn't kill us mid-run
-MAX_RUNTIME_SECONDS = 5.5 * 60 * 60
-START_TIME = time.time()
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RED    = "\033[91m"
+GREEN  = "\033[92m"
+CYAN   = "\033[96m"
+PINK   = "\033[95m"
+YELLOW = "\033[93m"
 
-thread_pool = ThreadPoolExecutor(max_workers=32)
+TAKEN_MESSAGES = [
+    f"{RED}{BOLD}🔒 SNAGGED — already claimed{RESET}",
+    f"{RED}{BOLD}💀 DEAD END — someone got there first{RESET}",
+    f"{RED}{BOLD}🚫 NO LUCK — this one's taken{RESET}",
+    f"{RED}{BOLD}😤 CLAIMED — move on{RESET}",
+    f"{RED}{BOLD}🔴 LOCKED IN — not yours{RESET}",
+]
 
+AVAILABLE_MESSAGES = [
+    f"{GREEN}{BOLD}✅ LET'S GO — it's yours for the taking{RESET}",
+    f"{GREEN}{BOLD}💎 CLEAN — nobody has this yet{RESET}",
+    f"{GREEN}{BOLD}🟢 OPEN SEASON — grab it{RESET}",
+    f"{GREEN}{BOLD}🤑 FREE REAL ESTATE — unclaimed{RESET}",
+    f"{GREEN}{BOLD}🚀 ALL YOURS — wide open{RESET}",
+]
+
+CLAIMED_MESSAGES = [
+    f"{GREEN}{BOLD}🎯 CLAIMED — it's yours now!{RESET}",
+    f"{GREEN}{BOLD}👑 SECURED — nobody can take it{RESET}",
+    f"{GREEN}{BOLD}💰 LOCKED IN — username saved{RESET}",
+]
+
+# ── State ─────────────────────────────────────────────────────────────────────
+available_names = []
+claimed_names   = []
+thread_pool     = ThreadPoolExecutor(max_workers=32)
+
+# ── Load Files ────────────────────────────────────────────────────────────────
 def load_usernames():
-    with open("usernames.txt", encoding="utf-8") as f:
-        return [x.strip().lstrip("@") for x in f if x.strip()]
+    if not os.path.exists(INPUT_FILE):
+        print(f"{RED}  ✖  '{INPUT_FILE}' not found!{RESET}")
+        return []
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        return [l.strip().lstrip("@") for l in f if l.strip()]
 
 def load_proxies():
     proxies = []
@@ -50,6 +94,7 @@ def load_proxies():
         pass
     return proxies
 
+# ── Claim Sessions ────────────────────────────────────────────────────────────
 claim_sessions = []
 for _ in range(8):
     s = requests.Session()
@@ -74,6 +119,7 @@ def get_claim_session():
     session_index += 1
     return s
 
+# ── Tokens ────────────────────────────────────────────────────────────────────
 def get_fresh_tokens():
     try:
         s = get_claim_session()
@@ -91,13 +137,14 @@ def get_fresh_tokens():
             return dtsg_match.group(1), lsd_match.group(1)
         return None, None
     except Exception as e:
-        print(f"  [Session] Error: {e}")
+        print(f"{YELLOW}  ⚠  Token fetch error: {e}{RESET}", flush=True)
         return None, None
 
+# ── Claim ─────────────────────────────────────────────────────────────────────
 def claim_username_sync(username):
     fb_dtsg, lsd = get_fresh_tokens()
     if not fb_dtsg or not lsd:
-        print(f"  [Claim] FAILED - no tokens for @{username}")
+        print(f"{YELLOW}  ⚠  No tokens — could not claim @{username}{RESET}", flush=True)
         return False
     payload = {
         "av": IDENTITY_ID,
@@ -130,85 +177,102 @@ def claim_username_sync(username):
         data = r.json()
         fxim = data.get("data", {}).get("fxim_update_identity_username", {})
         if fxim.get("error") is None and "fxim_update_identity_username" in data.get("data", {}):
-            print(f"  [Claim] SUCCESS - @{username} claimed!")
             return True
         err = fxim.get("error") or (data.get("errors") or [{}])[0].get("message", "unknown")
-        print(f"  [Claim] Failed @{username}: {err}")
+        print(f"{YELLOW}  ⚠  Claim failed @{username}: {err}{RESET}", flush=True)
         return False
     except Exception as e:
-        print(f"  [Claim] Error @{username}: {e}")
+        print(f"{YELLOW}  ⚠  Claim error @{username}: {e}{RESET}", flush=True)
         return False
 
-def send_webhook_sync(username, claimed):
-    if not WEBHOOK_URL:
+# ── Discord ───────────────────────────────────────────────────────────────────
+def send_discord_alert(username, claimed):
+    webhook = DISCORD_WEBHOOK or WEBHOOK_URL
+    if not webhook:
         return
-    msg = f"🎯 **CLAIMED:** `@{username}`" if claimed else f"✅ **Available (claim failed):** `@{username}`"
-    try:
-        requests.post(WEBHOOK_URL, json={"content": msg}, timeout=5)
-    except Exception:
-        pass
+    if claimed:
+        msg = f"@everyone\n🎯 **CLAIMED:** `@{username}`"
+    else:
+        msg = f"@everyone\n✅ **Available (claim failed):** `@{username}`"
+    for attempt in range(5):
+        try:
+            r = requests.post(
+                webhook,
+                json={"content": msg, "allowed_mentions": {"parse": ["everyone"]}},
+                timeout=10
+            )
+            if r.status_code in (200, 204):
+                return
+            if r.status_code == 429:
+                time.sleep(float(r.json().get("retry_after", 1)))
+                continue
+        except Exception:
+            time.sleep(1)
 
-def cap_variants(name):
+# ── Cap Variants ──────────────────────────────────────────────────────────────
+def cap_variants(name: str):
     seen = set()
-    for combo in itertools.product([0, 1], repeat=len(name)):
-        variant = "".join(
-            c.upper() if combo[i] else c.lower()
-            for i, c in enumerate(name)
-        )
-        if variant not in seen:
-            seen.add(variant)
-            yield variant
+    seen.add(name)
+    yield name
+    for v in {name.lower(), name.upper(), name.capitalize()}:
+        if v not in seen:
+            seen.add(v)
+            yield v
+    if len(name) <= 6:
+        for combo in itertools.product([0, 1], repeat=len(name)):
+            v = "".join(c.upper() if combo[i] else c.lower() for i, c in enumerate(name))
+            if v not in seen:
+                seen.add(v)
+                yield v
 
-available_names = []
-claimed_names = []
-
-async def horizon_check(client, username):
-    url = f"https://horizon.meta.com/profile/{username}/"
+# ── Horizon Check ─────────────────────────────────────────────────────────────
+async def horizon_check(client, variant):
+    url = f"https://horizon.meta.com/profile/{variant}/"
     try:
         r = await client.get(url)
         final = str(r.url).rstrip("/").lower()
-
-        # Only mark TAKEN if it lands on that exact profile page
-        if final == f"https://horizon.meta.com/profile/{username.lower()}":
+        if final == f"https://horizon.meta.com/profile/{variant.lower()}":
             return "TAKEN"
-
-        # Only mark AVAILABLE if it redirects to homepage exactly
         if final in ("https://horizon.meta.com", "https://www.meta.com"):
             return "AVAILABLE"
-
-        # Anything else = unknown, treat as TAKEN to be safe
+        return "TAKEN"
+    except httpx.TooManyRedirects:
+        return "TAKEN"
+    except Exception:
         return "TAKEN"
 
-    except httpx.TooManyRedirects:
-        return "TAKEN"  # be safe, don't try to claim
-    except Exception:
-        return "TAKEN"  # be safe
-
-async def check_single_name(semaphore, client, username, i, total):
+# ── Check Single Name ─────────────────────────────────────────────────────────
+async def check_single_name(semaphore, client, username, idx, total):
     async with semaphore:
-        try:
-            variants = list(cap_variants(username))
-            results = await asyncio.gather(*[horizon_check(client, v) for v in variants])
+        variants = list(cap_variants(username))
+        results  = await asyncio.gather(*[horizon_check(client, v) for v in variants])
+        prefix   = f"{DIM}[{idx:04}/{total:04}]{RESET} {BOLD}{CYAN}{username:<20}{RESET}"
 
-            if any(r == "TAKEN" for r in results):
-                print(f"[{i:>4}/{total}] @{username:<20} TAKEN")
-                return
+        if any(r == "TAKEN" for r in results):
+            print(f"{prefix}  {random.choice(TAKEN_MESSAGES)}", flush=True)
+            return
 
-            print(f"[{i:>4}/{total}] @{username:<20} AVAILABLE — claiming now...")
-            available_names.append(username)
+        # Available — try to claim immediately
+        print(f"{prefix}  {random.choice(AVAILABLE_MESSAGES)}", flush=True)
+        available_names.append(username)
 
-            loop = asyncio.get_event_loop()
-            success = await loop.run_in_executor(thread_pool, claim_username_sync, username)
-            asyncio.ensure_future(loop.run_in_executor(thread_pool, send_webhook_sync, username, success))
-            if success:
-                claimed_names.append(username)
+        loop    = asyncio.get_event_loop()
+        success = await loop.run_in_executor(thread_pool, claim_username_sync, username)
+        await loop.run_in_executor(thread_pool, send_discord_alert, username, success)
 
-        except Exception as e:
-            print(f"[{i:>4}/{total}] @{username:<20} ERROR: {e}")
+        if success:
+            claimed_names.append(username)
+            print(f"{prefix}  {random.choice(CLAIMED_MESSAGES)}", flush=True)
 
-async def run_cycle(names, proxies):
+# ── Run One Cycle ─────────────────────────────────────────────────────────────
+async def run_cycle(usernames, proxies, cycle):
+    total     = len(usernames)
+    batch     = usernames[:]
+    random.shuffle(batch)
+
     semaphore = asyncio.Semaphore(CONCURRENT)
-    proxy = random.choice(proxies) if proxies else None
+    proxy     = random.choice(proxies) if proxies else None
+
     client_kwargs = {
         "follow_redirects": True,
         "max_redirects": 5,
@@ -222,41 +286,54 @@ async def run_cycle(names, proxies):
     }
     if proxy:
         client_kwargs["proxy"] = proxy
+
     async with httpx.AsyncClient(**client_kwargs) as client:
         tasks = [
-            check_single_name(semaphore, client, name, i, len(names))
-            for i, name in enumerate(names, 1)
+            check_single_name(semaphore, client, name, i, total)
+            for i, name in enumerate(batch, 1)
         ]
         await asyncio.gather(*tasks)
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    names = load_usernames()
+    print(f"\n{CYAN}{BOLD}{'=' * 50}{RESET}")
+    print(f"{PINK}{BOLD}      💻  M E L L O W 'S  U S E R  F I N D E R  💻{RESET}")
+    print(f"{DIM}     24/7 mode — checks + auto-claims — loops 5.5hrs{RESET}")
+    print(f"{CYAN}{BOLD}{'=' * 50}{RESET}\n")
+
+    usernames = load_usernames()
+    if not usernames:
+        return
     proxies = load_proxies()
-    print(f"Loaded {len(names)} usernames | {len(proxies)} proxies | {CONCURRENT} concurrent")
-    print(f"Will run for up to 5.5 hours then stop (GitHub Actions reschedules automatically)\n")
+
+    print(f"{DIM}  Loaded {len(usernames)} usernames | {len(proxies)} proxies | {CONCURRENT} concurrent{RESET}\n", flush=True)
 
     cycle = 1
     while True:
-        # Stop before GitHub Actions 6hr limit kills us
         elapsed = time.time() - START_TIME
-        if elapsed > MAX_RUNTIME_SECONDS:
-            print(f"\nApproaching 6hr limit — stopping cleanly. GitHub Actions will restart shortly.")
+        if elapsed > MAX_RUNTIME:
+            print(f"\n{YELLOW}{BOLD}  ⏱  Approaching 6hr limit — stopping cleanly. GitHub Actions will restart.{RESET}\n")
             break
 
-        print(f"--- CYCLE {cycle} | Elapsed: {int(elapsed//60)}m ---\n")
-        await run_cycle(names, proxies)
-        print(f"\n--- CYCLE {cycle} DONE | Available: {len(available_names)} | Claimed: {len(claimed_names)} ---")
+        print(f"\n{CYAN}{DIM}  ── Cycle {cycle} | Elapsed: {int(elapsed // 60)}m | Available: {len(available_names)} | Claimed: {len(claimed_names)} ──{RESET}\n", flush=True)
 
-        if claimed_names:
-            print(f"  Claimed so far: {', '.join(claimed_names)}")
+        await run_cycle(usernames, proxies, cycle)
 
+        # Save results each cycle
         with open("available.txt", "w") as f:
             f.write("\n".join(available_names))
         with open("claimed.txt", "w") as f:
             f.write("\n".join(claimed_names))
 
         cycle += 1
-        print(f"\nRestarting cycle in 5 seconds...\n")
+        print(f"\n{DIM}  Cycle done. Restarting in 5 seconds...{RESET}", flush=True)
         await asyncio.sleep(5)
 
-asyncio.run(main())
+    print(f"\n{CYAN}{BOLD}{'=' * 50}{RESET}")
+    print(f"{GREEN}{BOLD}  💎  AVAILABLE: {len(available_names)}  |  🎯  CLAIMED: {len(claimed_names)}{RESET}")
+    if claimed_names:
+        print(f"{GREEN}  Claimed: {', '.join(claimed_names)}{RESET}")
+    print(f"{CYAN}{BOLD}{'=' * 50}{RESET}\n")
+
+if __name__ == "__main__":
+    asyncio.run(main())
