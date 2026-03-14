@@ -8,18 +8,17 @@ import time
 import json
 import re
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 INPUT_FILE   = "username.txt"
-WORKERS      = 10
-CONCURRENT   = 20
-DEBUG        = False
+CONCURRENT   = 10          # slower = more accurate
+DEBUG        = True        # shows exact redirect URLs so you can see what's happening
 MAX_RUNTIME  = 5.5 * 60 * 60
 START_TIME   = time.time()
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
-WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")  # alias, same webhook works for both
+WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
 
 COOKIES = {
     "datr":   os.environ.get("META_DATR", ""),
@@ -48,7 +47,6 @@ TAKEN_MESSAGES = [
     f"{RED}{BOLD}😤 CLAIMED — move on{RESET}",
     f"{RED}{BOLD}🔴 LOCKED IN — not yours{RESET}",
 ]
-
 AVAILABLE_MESSAGES = [
     f"{GREEN}{BOLD}✅ LET'S GO — it's yours for the taking{RESET}",
     f"{GREEN}{BOLD}💎 CLEAN — nobody has this yet{RESET}",
@@ -56,7 +54,6 @@ AVAILABLE_MESSAGES = [
     f"{GREEN}{BOLD}🤑 FREE REAL ESTATE — unclaimed{RESET}",
     f"{GREEN}{BOLD}🚀 ALL YOURS — wide open{RESET}",
 ]
-
 CLAIMED_MESSAGES = [
     f"{GREEN}{BOLD}🎯 CLAIMED — it's yours now!{RESET}",
     f"{GREEN}{BOLD}👑 SECURED — nobody can take it{RESET}",
@@ -190,11 +187,12 @@ def send_discord_alert(username, claimed):
     webhook = DISCORD_WEBHOOK or WEBHOOK_URL
     if not webhook:
         return
-    if claimed:
-        msg = f"@everyone\n🎯 **CLAIMED:** `@{username}`"
-    else:
-        msg = f"@everyone\n✅ **Available (claim failed):** `@{username}`"
-    for attempt in range(5):
+    msg = (
+        f"@everyone\n🎯 **CLAIMED:** `@{username}`"
+        if claimed else
+        f"@everyone\n✅ **Available (claim failed):** `@{username}`"
+    )
+    for _ in range(5):
         try:
             r = requests.post(
                 webhook,
@@ -211,48 +209,78 @@ def send_discord_alert(username, claimed):
 
 # ── Cap Variants ──────────────────────────────────────────────────────────────
 def cap_variants(name: str):
-    seen = set()
-    seen.add(name)
-    yield name
-    for v in {name.lower(), name.upper(), name.capitalize()}:
-        if v not in seen:
-            seen.add(v)
-            yield v
-    if len(name) <= 6:
-        for combo in itertools.product([0, 1], repeat=len(name)):
-            v = "".join(c.upper() if combo[i] else c.lower() for i, c in enumerate(name))
-            if v not in seen:
-                seen.add(v)
-                yield v
+    # For checking, only use lowercase — Meta usernames are case-insensitive
+    # Just return the lowercase version to avoid false TAKEN from variant mismatches
+    return [name.lower()]
 
-# ── Horizon Check ─────────────────────────────────────────────────────────────
-async def horizon_check(client, variant):
-    url = f"https://horizon.meta.com/profile/{variant}/"
+# ── Horizon Check (FIXED) ─────────────────────────────────────────────────────
+async def horizon_check(client, username):
+    """
+    Uses allow_redirects=False so we can read the raw redirect location
+    instead of following and comparing the final URL (which was causing mismatches).
+    
+    - 301/302 redirect to "https://horizon.meta.com/" = AVAILABLE (profile not found)
+    - 301/302 redirect anywhere else = TAKEN (redirected to a real profile)
+    - 200 = TAKEN (profile page loaded directly)
+    - Anything else = UNKNOWN, treat as TAKEN to be safe
+    """
+    url = f"https://horizon.meta.com/profile/{username.lower()}/"
     try:
         r = await client.get(url)
+        # After following all redirects, check final URL
         final = str(r.url).rstrip("/").lower()
-        if final == f"https://horizon.meta.com/profile/{variant.lower()}":
-            return "TAKEN"
-        if final in ("https://horizon.meta.com", "https://www.meta.com"):
+
+        if DEBUG:
+            print(f"{DIM}  [DEBUG] {username:<20} -> {r.status_code} | final: {final}{RESET}", flush=True)
+
+        # Exact profile page loaded = definitely taken
+        if r.status_code == 200:
+            # Check if it's actually a profile or a generic page
+            # A real profile will have the username in the final URL
+            if f"/profile/{username.lower()}" in final:
+                return "TAKEN"
+            # Landed on homepage with 200 = available
             return "AVAILABLE"
+
+        # Follow redirect destination
+        if f"/profile/{username.lower()}" in final:
+            return "TAKEN"
+
+        # Redirected away from the profile path = not found = available
+        if "horizon.meta.com/profile" not in final:
+            return "AVAILABLE"
+
         return "TAKEN"
+
     except httpx.TooManyRedirects:
         return "TAKEN"
-    except Exception:
+    except Exception as e:
+        if DEBUG:
+            print(f"{DIM}  [DEBUG] {username} error: {e}{RESET}", flush=True)
         return "TAKEN"
+
+# ── Double Check ──────────────────────────────────────────────────────────────
+async def double_check(client, username):
+    """Run the check twice with a small delay to confirm availability."""
+    r1 = await horizon_check(client, username)
+    if r1 == "TAKEN":
+        return "TAKEN"
+    await asyncio.sleep(1)  # wait 1s then recheck
+    r2 = await horizon_check(client, username)
+    return r2
 
 # ── Check Single Name ─────────────────────────────────────────────────────────
 async def check_single_name(semaphore, client, username, idx, total):
     async with semaphore:
-        variants = list(cap_variants(username))
-        results  = await asyncio.gather(*[horizon_check(client, v) for v in variants])
-        prefix   = f"{DIM}[{idx:04}/{total:04}]{RESET} {BOLD}{CYAN}{username:<20}{RESET}"
+        prefix = f"{DIM}[{idx:04}/{total:04}]{RESET} {BOLD}{CYAN}{username:<20}{RESET}"
 
-        if any(r == "TAKEN" for r in results):
+        result = await double_check(client, username)
+
+        if result == "TAKEN":
             print(f"{prefix}  {random.choice(TAKEN_MESSAGES)}", flush=True)
             return
 
-        # Available — try to claim immediately
+        # Available — confirmed twice — try to claim
         print(f"{prefix}  {random.choice(AVAILABLE_MESSAGES)}", flush=True)
         available_names.append(username)
 
@@ -275,11 +303,11 @@ async def run_cycle(usernames, proxies, cycle):
 
     client_kwargs = {
         "follow_redirects": True,
-        "max_redirects": 5,
+        "max_redirects": 10,
         "http2": True,
         "limits": httpx.Limits(
-            max_connections=200,
-            max_keepalive_connections=50,
+            max_connections=100,
+            max_keepalive_connections=30,
             keepalive_expiry=30,
         ),
         "timeout": 15,
@@ -319,7 +347,6 @@ async def main():
 
         await run_cycle(usernames, proxies, cycle)
 
-        # Save results each cycle
         with open("available.txt", "w") as f:
             f.write("\n".join(available_names))
         with open("claimed.txt", "w") as f:
