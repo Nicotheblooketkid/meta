@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 # ── Config ────────────────────────────────────────────────────────────────────
 INPUT_FILE   = "username.txt"
 CONCURRENT   = 10
-DEBUG        = True   # keep on so we can see exactly what's happening
+DEBUG        = True
 MAX_RUNTIME  = 5.5 * 60 * 60
 START_TIME   = time.time()
 
@@ -224,36 +224,45 @@ def cap_variants(name: str):
                 seen.add(v)
                 yield v
 
-# ── Horizon Check ─────────────────────────────────────────────────────────────
+# ── Horizon Check (CORRECT LOGIC) ────────────────────────────────────────────
+# Meta returns:
+#   302 → location: https://horizon.meta.com/          = AVAILABLE (profile not found)
+#   302 → location: https://horizon.meta.com/profile/  = TAKEN (redirected to real profile)
+#   200                                                 = TAKEN (profile loaded directly)
+# We must NOT follow redirects — read the raw 302 location header.
 async def horizon_check(client, variant):
     url = f"https://horizon.meta.com/profile/{variant}/"
     try:
         r = await client.get(url)
-        final = str(r.url).rstrip("/")
         status = r.status_code
+        location = r.headers.get("location", "")
 
         if DEBUG:
-            print(f"{DIM}  [DEBUG] variant={variant!r:25} status={status} final={final!r}{RESET}", flush=True)
+            print(f"{DIM}  [DEBUG] {variant:<20} status={status} location={location!r}{RESET}", flush=True)
 
         if status in (401, 402, 403):
             return "UNKNOWN"
 
-        # TAKEN: final URL still contains the profile path for this username
-        if f"/profile/{variant.lower()}" in final.lower():
+        if status in (301, 302):
+            loc = location.rstrip("/").lower()
+            # Redirected to homepage = profile not found = AVAILABLE
+            if loc in ("https://horizon.meta.com", "https://www.meta.com"):
+                return "AVAILABLE"
+            # Redirected anywhere else (e.g. back to a profile) = TAKEN
             return "TAKEN"
 
-        # AVAILABLE: redirected away from profile entirely
-        if "/profile/" not in final.lower():
-            return "AVAILABLE"
+        # 200 = profile page loaded = TAKEN
+        if status == 200:
+            return "TAKEN"
 
-        # Some other profile path — treat as taken to be safe
+        # Anything else = treat as TAKEN to be safe
         return "TAKEN"
 
     except httpx.TooManyRedirects:
         return "TAKEN"
     except Exception as e:
         if DEBUG:
-            print(f"{DIM}  [DEBUG] variant={variant!r} exception={e}{RESET}", flush=True)
+            print(f"{DIM}  [DEBUG] {variant} exception: {e}{RESET}", flush=True)
         return "UNKNOWN"
 
 # ── Check Single Name ─────────────────────────────────────────────────────────
@@ -263,11 +272,6 @@ async def check_single_name(semaphore, client, username, idx, total):
 
         variants = list(cap_variants(username))
         results  = await asyncio.gather(*[horizon_check(client, v) for v in variants])
-
-        # Print a summary line showing what each variant returned
-        if DEBUG:
-            summary = dict(zip(variants[:4], results[:4]))  # show first 4 to keep logs readable
-            print(f"{DIM}  [SUMMARY] {username}: {summary}{RESET}", flush=True)
 
         if any(r == "TAKEN" for r in results):
             print(f"{prefix}  {random.choice(TAKEN_MESSAGES)}", flush=True)
@@ -305,8 +309,7 @@ async def run_cycle(usernames, proxies, cycle):
     proxy     = random.choice(proxies) if proxies else None
 
     client_kwargs = {
-        "follow_redirects": True,
-        "max_redirects": 10,
+        "follow_redirects": False,  # CRITICAL — read raw 302 location directly
         "http2": True,
         "cookies": COOKIES,
         "headers": {
