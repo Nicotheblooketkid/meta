@@ -12,17 +12,20 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 INPUT_FILE   = "username.txt"
-CONCURRENT   = 10          # slower = more accurate
-DEBUG        = True        # shows exact redirect URLs so you can see what's happening
+CONCURRENT   = 10
+DEBUG        = True
 MAX_RUNTIME  = 5.5 * 60 * 60
 START_TIME   = time.time()
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")
 
+META_DATR = os.environ.get("META_DATR", "")
+META_FS   = os.environ.get("META_FS", "")
+
 COOKIES = {
-    "datr":   os.environ.get("META_DATR", ""),
-    "fs":     os.environ.get("META_FS", ""),
+    "datr":   META_DATR,
+    "fs":     META_FS,
     "locale": "en_US",
 }
 
@@ -209,44 +212,35 @@ def send_discord_alert(username, claimed):
 
 # ── Cap Variants ──────────────────────────────────────────────────────────────
 def cap_variants(name: str):
-    # For checking, only use lowercase — Meta usernames are case-insensitive
-    # Just return the lowercase version to avoid false TAKEN from variant mismatches
-    return [name.lower()]
+    seen = set()
+    for v in [name.lower(), name.upper(), name.capitalize()]:
+        if v not in seen:
+            seen.add(v)
+            yield v
+    if len(name) <= 8:
+        for combo in itertools.product([0, 1], repeat=len(name)):
+            v = "".join(c.upper() if combo[i] else c.lower() for i, c in enumerate(name))
+            if v not in seen:
+                seen.add(v)
+                yield v
 
-# ── Horizon Check (FIXED) ─────────────────────────────────────────────────────
-async def horizon_check(client, username):
-    """
-    Uses allow_redirects=False so we can read the raw redirect location
-    instead of following and comparing the final URL (which was causing mismatches).
-    
-    - 301/302 redirect to "https://horizon.meta.com/" = AVAILABLE (profile not found)
-    - 301/302 redirect anywhere else = TAKEN (redirected to a real profile)
-    - 200 = TAKEN (profile page loaded directly)
-    - Anything else = UNKNOWN, treat as TAKEN to be safe
-    """
-    url = f"https://horizon.meta.com/profile/{username.lower()}/"
+# ── Horizon Check ─────────────────────────────────────────────────────────────
+async def horizon_check(client, variant):
+    url = f"https://horizon.meta.com/profile/{variant}/"
     try:
         r = await client.get(url)
-        # After following all redirects, check final URL
         final = str(r.url).rstrip("/").lower()
 
         if DEBUG:
-            print(f"{DIM}  [DEBUG] {username:<20} -> {r.status_code} | final: {final}{RESET}", flush=True)
+            print(f"{DIM}  [DEBUG] {variant:<20} status={r.status_code} final={final}{RESET}", flush=True)
 
-        # Exact profile page loaded = definitely taken
-        if r.status_code == 200:
-            # Check if it's actually a profile or a generic page
-            # A real profile will have the username in the final URL
-            if f"/profile/{username.lower()}" in final:
-                return "TAKEN"
-            # Landed on homepage with 200 = available
-            return "AVAILABLE"
+        if r.status_code in (401, 402, 403):
+            print(f"{YELLOW}  ⚠  Auth error {r.status_code} on @{variant} — cookies may be expired{RESET}", flush=True)
+            return "UNKNOWN"
 
-        # Follow redirect destination
-        if f"/profile/{username.lower()}" in final:
+        if f"/profile/{variant.lower()}" in final:
             return "TAKEN"
 
-        # Redirected away from the profile path = not found = available
         if "horizon.meta.com/profile" not in final:
             return "AVAILABLE"
 
@@ -256,31 +250,34 @@ async def horizon_check(client, username):
         return "TAKEN"
     except Exception as e:
         if DEBUG:
-            print(f"{DIM}  [DEBUG] {username} error: {e}{RESET}", flush=True)
-        return "TAKEN"
-
-# ── Double Check ──────────────────────────────────────────────────────────────
-async def double_check(client, username):
-    """Run the check twice with a small delay to confirm availability."""
-    r1 = await horizon_check(client, username)
-    if r1 == "TAKEN":
-        return "TAKEN"
-    await asyncio.sleep(1)  # wait 1s then recheck
-    r2 = await horizon_check(client, username)
-    return r2
+            print(f"{DIM}  [DEBUG] {variant} exception: {e}{RESET}", flush=True)
+        return "UNKNOWN"
 
 # ── Check Single Name ─────────────────────────────────────────────────────────
 async def check_single_name(semaphore, client, username, idx, total):
     async with semaphore:
         prefix = f"{DIM}[{idx:04}/{total:04}]{RESET} {BOLD}{CYAN}{username:<20}{RESET}"
 
-        result = await double_check(client, username)
+        variants = list(cap_variants(username))
 
-        if result == "TAKEN":
+        # Check all variants concurrently
+        results = await asyncio.gather(*[horizon_check(client, v) for v in variants])
+
+        if any(r == "TAKEN" for r in results):
             print(f"{prefix}  {random.choice(TAKEN_MESSAGES)}", flush=True)
             return
 
-        # Available — confirmed twice — try to claim
+        if all(r == "UNKNOWN" for r in results):
+            print(f"{YELLOW}  ⚠  All variants inconclusive for @{username} — skipping{RESET}", flush=True)
+            return
+
+        # Double check base name before claiming
+        await asyncio.sleep(1)
+        recheck = await horizon_check(client, username.lower())
+        if recheck != "AVAILABLE":
+            print(f"{prefix}  {random.choice(TAKEN_MESSAGES)}", flush=True)
+            return
+
         print(f"{prefix}  {random.choice(AVAILABLE_MESSAGES)}", flush=True)
         available_names.append(username)
 
@@ -294,8 +291,8 @@ async def check_single_name(semaphore, client, username, idx, total):
 
 # ── Run One Cycle ─────────────────────────────────────────────────────────────
 async def run_cycle(usernames, proxies, cycle):
-    total     = len(usernames)
-    batch     = usernames[:]
+    total = len(usernames)
+    batch = usernames[:]
     random.shuffle(batch)
 
     semaphore = asyncio.Semaphore(CONCURRENT)
@@ -305,6 +302,11 @@ async def run_cycle(usernames, proxies, cycle):
         "follow_redirects": True,
         "max_redirects": 10,
         "http2": True,
+        "cookies": COOKIES,
+        "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
         "limits": httpx.Limits(
             max_connections=100,
             max_keepalive_connections=30,
@@ -328,6 +330,10 @@ async def main():
     print(f"{PINK}{BOLD}      💻  M E L L O W 'S  U S E R  F I N D E R  💻{RESET}")
     print(f"{DIM}     24/7 mode — checks + auto-claims — loops 5.5hrs{RESET}")
     print(f"{CYAN}{BOLD}{'=' * 50}{RESET}\n")
+
+    if not META_DATR or not META_FS:
+        print(f"{RED}  ✖  META_DATR or META_FS secrets not set — cookies required!{RESET}")
+        return
 
     usernames = load_usernames()
     if not usernames:
